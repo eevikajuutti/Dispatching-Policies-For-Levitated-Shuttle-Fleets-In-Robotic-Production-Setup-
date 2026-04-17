@@ -1,0 +1,1153 @@
+PROGRAM _INIT
+	// Initialazation program
+	
+    // Force FB instances to initialize
+	gCommInput;
+	gCommOutput;
+	gAssembly6D_1;
+	
+	// Init state-machine indices
+	i := 0;
+	State.State := 100;			// Main state machine begins in grouping/centering phase
+	Substate.State := 10;		// First step inside that phase
+	// ShuttlesCentered := 0;		// No shuttles centered yet
+
+	// Link all ACP6D FBs to the same Assembly instance (Need a pointer to same assembly instance)
+	AssemblyReadInfo.Assembly := ADR(gAssembly6D_1);
+	AssemblyPowerOn.Assembly := ADR(gAssembly6D_1);
+	AssemblyPowerOff.Assembly := ADR(gAssembly6D_1);
+	AssemblyReset.Assembly := ADR(gAssembly6D_1);
+	AssemblyGetShuttle.Assembly := ADR(gAssembly6D_1);
+
+	// Default XY test move (used only for manual testing)
+	ShuttleMoveXY.Shuttle := ADR(gShuttleList[0].Ref);
+	ShuttleMoveXY.Parameters.Velocity := 0.2; //[m/s]
+	ShuttleMoveXY.Parameters.Acceleration := 2.0; //[m/s²]
+	ShuttleMoveXY.Parameters.Position.X := 0.48; //[m]
+	ShuttleMoveXY.Parameters.Position.Y := 0.12; //[m] 
+	ShuttleMoveXY.Parameters.Path := mcACP6D_PATH_DIRECT;
+	ShuttleMoveXY.Parameters.Mode := mcACP6D_MOVE_ABSOLUTE;
+	
+	// Reset 3-second stop timers for all shuttles
+	FOR k := 0 TO MAX_INDEX_SHUTTLE DO
+		StopUntil[k] := 0;
+	END_FOR
+	
+	// Reset per-shuttle order start timestamps
+	FOR ShIndex := 0 TO MAX_INDEX_SHUTTLE DO
+		ShStartMs[ShIndex] := 0;
+	END_FOR;
+	
+	// Initialize workstation time accumulators (for performance metrics)
+	FOR iSort := 1 TO 6 DO
+		WSBusyAcc[iSort] := FALSE;   // Busy marker within current second window
+		WSIdleSec[iSort] := 0;       // Total idle seconds
+	END_FOR
+
+	// Reset all shuttle order/task states
+	FOR ShIndex := 0 TO MAX_INDEX_SHUTTLE DO
+		gShuttleList[ShIndex].WorkStation := 0;   // wait for pickup to assign WS
+		gShuttleList[ShIndex].HasOrder    := FALSE;
+		gShuttleList[ShIndex].OrderStatus := FALSE;
+		gShuttleList[ShIndex].CurrentTask := 0;
+	END_FOR
+	
+	// Reset all simulation and performance metrics
+	CompWriteIx    := 0;
+	CompValidCount := 0;
+	AvgCompMs := 0;  AvgCompSec := 0.0;
+	P95CompMs := 0;  P95CompSec := 0.0;
+	
+	OrdersAssigned := 0;
+	OrdersCompleted := 0;
+	
+	ElapsedSec := 0;
+	NowMs := 0;
+	
+	ThroughputPerMin := 0.0;
+	QueueLen := 0;
+
+	// Round-robin assignment starts from order 1 and WS index 0 (WS1)
+	NextOIndex := 1;
+	NextWS := 0;
+
+	// WS pad ownership cleared (no shuttle owns any pad at startup)
+	FOR ws := 1 TO 6 DO
+		PadOwner[ws] := 0;
+	END_FOR
+
+	// Last-seen segment for every shuttle is unknown (0)
+	// Resets last-known shuttle segments
+	FOR k := 0 TO MAX_INDEX_SHUTTLE DO
+		LastSeg[k] := 0;
+	END_FOR
+
+	// Reset queue statistics for each workstation
+	FOR ws := 1 TO 6 DO
+		WSQueueInstant[ws] := 0;
+		WSQueueSum[ws]     := 0;
+		WSQueueBusySec[ws] := 0;
+		WSQueueAvg[ws]     := 0.0;
+	END_FOR
+
+
+	// Reset total simulation timing / state flags
+	SimStartMs := 0;
+	SimEndMs := 0;
+	OverallCompMs := 0;
+	OverallCompSec := 0.0;
+
+	RunActive := FALSE;     // No run active yet
+	SystemActive := FALSE;  // System not active until power+READY
+	
+END_PROGRAM
+
+PROGRAM _CYCLIC
+	
+	// System is active only when power is ON and the MAIN machine is in READY state
+	SystemActive := gMain.Cmd.Power AND (MainState = MAIN_READY);
+	
+	
+	// Power turned ON or external simulation reset -> reset all order/metric counters
+	IF (gMain.Cmd.Power AND NOT PrevPowerCmd) OR ResetSimReq THEN
+		// Order list restarted from first order
+		NextOIndex      := 1;      // 1-based
+		OrdersAssigned  := 0;
+		OrdersCompleted := 0;
+
+		// Reset metrics (timing, averages, throughput and queue length)
+		ElapsedSec      := 0;
+		NowMs           := 0;
+		AvgCompMs       := 0;  AvgCompSec := 0.0;
+		P95CompMs       := 0;  P95CompSec := 0.0;
+		ThroughputPerMin:= 0.0;
+		QueueLen        := 0;
+
+		// Reset workstation busy/idle accumulators for performance tracking
+		WSBusyAcc[1] := FALSE; WSBusyAcc[2] := FALSE; WSBusyAcc[3] := FALSE;
+		WSBusyAcc[4] := FALSE; WSBusyAcc[5] := FALSE; WSBusyAcc[6] := FALSE;
+		WSIdleSec[1] := 0; WSIdleSec[2] := 0; WSIdleSec[3] := 0;
+		WSIdleSec[4] := 0; WSIdleSec[5] := 0; WSIdleSec[6] := 0;
+
+		// Clear completion samples
+		CompWriteIx    := 0;
+		CompValidCount := 0;
+
+		// Clear all per-shuttle order/task status and timestamps
+		FOR ShIndex := 0 TO MAX_INDEX_SHUTTLE DO
+			gShuttleList[ShIndex].WorkStation := 0;
+			gShuttleList[ShIndex].HasOrder    := FALSE;
+			gShuttleList[ShIndex].OrderStatus := FALSE;
+			gShuttleList[ShIndex].CurrentTask := 0;
+			ShStartMs[ShIndex] := 0;
+		END_FOR;
+
+		// Finalize reset
+		ResetSimReq   := FALSE; // one-shot reset
+	END_IF;
+
+	// Keeps last power value so rising edge can be detected next cycle.
+	PrevPowerCmd := gMain.Cmd.Power;
+
+		
+	CASE MainState OF
+		
+		MAIN_STARTUP:
+			// Start reading assembly information
+			AssemblyReadInfo.Enable := TRUE;
+			
+			//Wait for the startup phase to be finished
+			IF AssemblyReadInfo.Valid THEN
+				IF (AssemblyReadInfo.AssemblyInfo.AssemblyState = mcACP6D_ERRORSTOP) THEN
+					MainState := MAIN_ERROR;
+				ELSIF (AssemblyReadInfo.AssemblyInfo.AssemblyState <> mcACP6D_STARTUP) THEN
+					MainState := MAIN_POWER_OFF;
+				END_IF
+			END_IF
+
+		MAIN_POWER_OFF:
+			AssemblyPowerOff.Execute := TRUE;
+			
+			// Request assembly to power off
+			IF AssemblyPowerOff.Done THEN
+				AssemblyPowerOff.Execute := FALSE;
+				MainState := MAIN_DISABLED;
+			ELSIF AssemblyPowerOff.Error OR AssemblyPowerOff.CommandAborted THEN
+				MainState := MAIN_ERROR;
+			END_IF
+
+		MAIN_DISABLED:
+			// Reset all logic-level states because system is disabled
+			State.State := 100;
+			State.StateInfo := 'Track Disabled';
+			Substate.State := 10;
+			Substate.StateInfo := 'Track Disabled';
+			i := 0;
+			// ShuttlesCentered := 0; 
+			IF gMain.Cmd.Power THEN
+				MainState := MAIN_POWER_ON;
+			END_IF
+
+		MAIN_POWER_ON:
+			AssemblyPowerOn.Execute := TRUE;
+			
+			// Start powering on assembly
+			IF AssemblyPowerOn.Done THEN
+				AssemblyPowerOn.Execute := FALSE;
+				MainState := MAIN_GET_SHUTTLE;
+			ELSIF AssemblyPowerOn.Error OR AssemblyPowerOn.CommandAborted THEN
+				MainState := MAIN_ERROR;
+			END_IF
+
+		MAIN_GET_SHUTTLE:
+			// Retrieves shuttle references one by one
+			AssemblyGetShuttle.Enable := TRUE;
+
+			IF AssemblyGetShuttle.Valid THEN
+				gMain.Status.ShuttlesPresent := AssemblyGetShuttle.TotalCount;
+
+				IF (AssemblyGetShuttle.TotalCount = 0) THEN
+					AssemblyGetShuttle.Enable := FALSE;
+					MainState := MAIN_READY;
+				ELSE
+					//Prevent access to wrong memory area
+					ShIndex := LIMIT(0, AssemblyGetShuttle.TotalCount - AssemblyGetShuttle.RemainingCount - 1, MAX_INDEX_SHUTTLE);
+					//Store information to use it in global commands
+					gShuttleList[ShIndex].ID := AssemblyGetShuttle.AdditionalInfo.ShuttleID;
+					gShuttleList[ShIndex].Ref := AssemblyGetShuttle.Shuttle;
+					gShuttleList[ShIndex].Info.Shuttle := ADR(gShuttleList[ShIndex].Ref);    // Switch back to get from read
+					gShuttleList[ShIndex].MovementCommand.Shuttle := ADR(gShuttleList[ShIndex].Ref);
+					gShuttleList[ShIndex].MovementCommand.Parameters.Acceleration := 10.0;
+					gShuttleList[ShIndex].MovementCommand.Parameters.Velocity := 1.0;
+					gShuttleList[ShIndex].MovementCommand.Parameters.EndVelocity := 0;
+					gShuttleList[ShIndex].MovementCommand.Parameters.Path := mcACP6D_PATH_DIRECT;
+
+					IF (AssemblyGetShuttle.RemainingCount > 0) THEN
+						AssemblyGetShuttle.Next := TRUE;
+						MainState := MAIN_GET_SHUTTLE_WAIT;
+					ELSE
+						AssemblyGetShuttle.Enable := FALSE;
+						MainState := MAIN_READY; 
+					END_IF
+				END_IF
+			ELSIF AssemblyGetShuttle.Error THEN
+				MainState := MAIN_ERROR;
+			END_IF
+
+		MAIN_GET_SHUTTLE_WAIT:
+			// A required handshake pattern for ACP6D
+			AssemblyGetShuttle.Next := FALSE;
+			MainState := MAIN_GET_SHUTTLE;
+
+		MAIN_READY:
+			IF NOT(gMain.Cmd.Power) THEN
+				MainState := MAIN_POWER_OFF;
+			END_IF
+			
+			CASE State.State OF
+				100:
+					State.StateInfo := 'Assigning initial groups to shuttles';
+					// -------------------------------------------------------------------------------------
+					// Let's run substates
+					CASE Substate.State OF
+						10:
+							Substate.StateInfo := 'Stopping movement commands';
+							// -----------------------------------------------------------------------------
+							// Ensure shuttle is not moving before reading info
+							gShuttleList[i].MovementCommand(Execute := FALSE);	
+							Substate.State := 20;
+						20:
+							Substate.StateInfo := 'Reading shuttle info';
+							// -----------------------------------------------------------------------------
+							// Read current shuttle position/status
+							gShuttleList[i].Info(Execute := TRUE);
+							gShuttleList[i].Centered := FALSE;
+							IF gShuttleList[i].Info.Done THEN
+								Substate.State := 30;
+							END_IF;
+						30:
+							Substate.StateInfo := 'Finding segment';
+							// -----------------------------------------------------------------------------
+							IF NOT Positioner_0.Execute THEN
+								// Convert shuttle XY position to a segment index using Positioner_0
+								Positioner_0.Position := gShuttleList[i].Info.ShuttleInfo.Position;
+								Positioner_0(Execute := TRUE);
+								gShuttleList[i].Info(Execute := FALSE);
+							END_IF;
+							IF Positioner_0.Done THEN
+								Positioner_0.Execute := FALSE;
+								gShuttleList[i].InitialSegment := Positioner_0.Segment;
+								Substate.State := 40;
+							END_IF;
+						40:
+							Substate.StateInfo := 'Assigning initial groups';
+							// -----------------------------------------------------------------------------
+							// Add this shuttle to its initial segment's group list
+							GI := gShuttleList[i].InitialSegment;
+							ShuttleGroups[GI].List.ShuttleList[ShuttleGroups[GI].LastIndex].Shuttle := ADR(gShuttleList[i].Ref);
+							ShuttleGroups[GI].LastIndex := ShuttleGroups[GI].LastIndex + 1;
+							Substate.State := 10;
+							i := i + 1;
+							IF i >= gMain.Status.ShuttlesPresent THEN
+								i := 0;
+								State.State := 400; // Done grouping -> start normal running
+							END_IF;
+					END_CASE;
+					
+				400:
+					State.StateInfo := 'Running';
+					// -------------------------------------------------------------------------------------
+					// Let's run substates
+					CASE Substate.State OF
+						10:
+							// -----------------------------------------------------------------------------
+							// If shuttle is moving, continue movement until done.
+							// Otherwise begin reading info.
+							IF gShuttleList[i].MovementCommand.Execute THEN
+								gShuttleList[i].MovementCommand();
+								IF gShuttleList[i].MovementCommand.Done THEN
+									Substate.State := 40;
+								ELSE
+									i := i + 1;
+									IF i >= gMain.Status.ShuttlesPresent THEN
+										i := 0;
+									END_IF;
+								END_IF
+							ELSE
+								Substate.StateInfo := 'Reading shuttle info';
+								gShuttleList[i].Info(Execute := TRUE);
+								IF gShuttleList[i].Info.Done THEN
+									Substate.State := 20;
+								END_IF;
+							END_IF;
+					
+
+						
+						20:
+							// -----------------------------------------------------------------------------
+							Substate.StateInfo := 'Getting shuttle segment';
+							// Convert shuttle XY position to a track segment number
+							IF NOT Positioner_0.Execute THEN
+								Positioner_0.Position := gShuttleList[i].Info.ShuttleInfo.Position;
+								Positioner_0(Execute := TRUE);
+								gShuttleList[i].Info(Execute := FALSE); // stop info FB while computing
+							END_IF;
+							
+							// Segment resolved -> store last known segment
+							IF Positioner_0.Done THEN
+								Positioner_0.Execute := FALSE;
+								
+								LastSeg[i] := Positioner_0.Segment;
+								
+								
+								// If shuttle is physically in segment 1, make it the owner immediately
+								IF LastSeg[i] = 1 THEN
+									Seg1Owner := gShuttleList[i].ID;
+								END_IF;
+
+								
+								
+								// Apply 3s pause:
+									// Segment 1: only after first 10 seconds of simulation
+									// Segment 50: only if order queue is not empty
+
+								IF (LastSeg[i] = 1) AND NowMs > 10000 THEN
+									IF StopUntil[i] < NowMs THEN
+										StopUntil[i] := NowMs + 3000;
+									END_IF;
+								END_IF;
+								
+								IF (LastSeg[i] = 50) AND (NextOIndex <= gOrders.Count) THEN
+									IF StopUntil[i] < NowMs THEN
+										StopUntil[i] := NowMs + 3000;
+									END_IF;
+								END_IF;
+								
+								// Maintain correct ownership for segment 1
+								// Claim if shuttle is physically on segment 1
+								IF LastSeg[i] = 1 THEN
+									// If nobody owns segment 1, claim it
+									IF Seg1Owner = 0 THEN
+										Seg1Owner := gShuttleList[i].ID;
+									END_IF;
+								END_IF;
+
+								// Release if no shuttle is actually there
+								// If Seg1Owner is set but no shuttle is actually in segment 1 -> free it
+								IF Seg1Owner <> 0 THEN
+									ownerPresent := FALSE;
+									FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+										IF LastSeg[k] = 1 THEN
+											ownerPresent := TRUE;
+										END_IF
+									END_FOR;
+
+									IF NOT ownerPresent THEN
+										Seg1Owner := 0;
+									END_IF;
+								END_IF;
+					
+								// Compute target upstream segment based on routing:
+									// Has order + WS assigned -> go to workstation
+									// Has order but no WS -> go to drop-off (segment 1)
+									// No order -> go to pickup (segment 50)
+								IF gShuttleList[i].WorkStation > 0 AND gShuttleList[i].HasOrder THEN
+									// Shuttle goes to Workstation
+									gShuttleList[i].NextSeg := UpstreamSeg[gShuttleList[i].WorkStation];
+
+								ELSIF gShuttleList[i].HasOrder THEN
+									// Shuttle goes to Segment 1
+									gShuttleList[i].NextSeg := UpstreamSeg1;
+
+								ELSE
+									// Shuttle goes to Segment 50
+									gShuttleList[i].NextSeg := UpstreamSeg50;
+
+								END_IF;
+
+								// Resolve pad segment and upstream segment for this shuttle's WS (if any)
+								IF (gShuttleList[i].WorkStation >= 1) AND (gShuttleList[i].WorkStation <= 6) THEN
+									padSeg := WSPadSeg[gShuttleList[i].WorkStation];
+									upSeg  := UpstreamSeg[gShuttleList[i].WorkStation];
+								ELSE
+									padSeg := 0;
+									upSeg  := 0;
+								END_IF;
+
+								// Release pad ownership if shuttle is no longer on its WS pad
+								FOR ws := 1 TO 6 DO
+									IF PadOwner[ws] = gShuttleList[i].ID THEN
+										IF (gShuttleList[i].WorkStation <> ws) OR (Positioner_0.Segment <> WSPadSeg[ws]) THEN
+											PadOwner[ws] := 0;
+										END_IF;
+									END_IF;
+								END_FOR;
+
+								// Release segment 50/1 ownership when leaving those segments
+								IF Seg50Owner = gShuttleList[i].ID THEN
+									IF Positioner_0.Segment <> 50 THEN
+										Seg50Owner := 0;
+									END_IF;
+								END_IF;
+
+								IF Seg1Owner = gShuttleList[i].ID THEN
+									IF Positioner_0.Segment <> 1 THEN
+										Seg1Owner := 0;
+									END_IF;
+								END_IF;
+
+								// Claim upstream segment (segment 50 or segment 1) if it is free
+								IF Positioner_0.Segment = UpstreamSeg50 THEN
+									IF Seg50Owner = 0 THEN
+										Seg50Owner := gShuttleList[i].ID;
+									END_IF;
+								END_IF;
+
+
+								IF gShuttleList[i].HasOrder AND (Positioner_0.Segment = UpstreamSeg1) THEN
+									IF Seg1Owner = 0 THEN
+										Seg1Owner := gShuttleList[i].ID;
+									END_IF;
+								END_IF;
+
+
+								// Prevent entering upstream if another shuttle owns the critical segment
+								// -> Hold movement and skip to next shuttle
+								IF (Seg50Owner <> 0) AND (Seg50Owner <> gShuttleList[i].ID) THEN
+									IF Positioner_0.Segment = UpstreamSeg50 THEN
+										gShuttleList[i].MovementCommand(Execute := FALSE);
+
+										Substate.State := 10;
+										i := i + 1;
+										IF i >= gMain.Status.ShuttlesPresent THEN
+											i := 0;
+										END_IF;
+
+										RETURN;
+									END_IF;
+								END_IF;
+
+								IF gShuttleList[i].HasOrder
+									AND (Seg1Owner <> 0)
+									AND (Seg1Owner <> gShuttleList[i].ID)
+									AND (Positioner_0.Segment = UpstreamSeg1)
+									THEN
+									gShuttleList[i].MovementCommand(Execute := FALSE);
+
+									Substate.State := 10;
+									i := i + 1;
+									IF i >= gMain.Status.ShuttlesPresent THEN
+										i := 0;
+									END_IF;
+
+									RETURN;
+								END_IF;
+
+								// If shuttle is on its WS pad, claim/keep pad ownership
+								IF (gShuttleList[i].WorkStation >= 1) AND (gShuttleList[i].WorkStation <= 6) THEN
+									IF Positioner_0.Segment = padSeg THEN
+										IF (PadOwner[gShuttleList[i].WorkStation] = 0)
+											OR (PadOwner[gShuttleList[i].WorkStation] = gShuttleList[i].ID) THEN
+											PadOwner[gShuttleList[i].WorkStation] := gShuttleList[i].ID;
+										END_IF;
+									ELSIF PadOwner[gShuttleList[i].WorkStation] = gShuttleList[i].ID THEN
+										PadOwner[gShuttleList[i].WorkStation] := 0;
+									END_IF;
+								END_IF;
+
+								// Order pickup logic at segment 50 (FCFS + round-robin WS assignment)
+								IF (Positioner_0.Segment = 50) AND (NOT gShuttleList[i].HasOrder) THEN
+									// stay here this scan so we don't miss the pickup handshake
+									gShuttleList[i].MovementCommand(Execute := FALSE);
+
+									// FCFS pickup at Segment 50, consistent 1-based indexing
+									IF (Positioner_0.Segment = 50) AND (NOT gShuttleList[i].HasOrder) THEN
+										// stay here this scan so we don't miss the pickup handshake
+										gShuttleList[i].MovementCommand(Execute := FALSE);
+										IF NextOIndex <= gOrders.Count THEN
+											// Assign next order
+											gShuttleList[i].AssignedOrder := gOrders.OrderList[NextOIndex];
+											gShuttleList[i].HasOrder      := TRUE;
+											
+											// Start overall timer on the first assignment of this run
+											IF NOT RunActive THEN
+												RunActive := TRUE;
+												SimStartMs := NowMs;   // NowMs already ticks in your heartbeat
+											END_IF;
+											
+											gShuttleList[i].OrderStatus   := FALSE;
+											gShuttleList[i].CurrentTask   := 1;
+
+											// Round-robin WorkStation: 1..6
+											tempWS := (NextWS MOD 6);                     // 0..5
+											gShuttleList[i].WorkStation := 1 + tempWS;   // 1..6
+											NextWS := NextWS + 1;
+
+											// Mark job start time
+											ShStartMs[i] := NowMs;
+
+											// Advance orders
+											NextOIndex := NextOIndex + 1;
+											OrdersAssigned := OrdersAssigned + 1;
+
+											Substate.StateInfo := 'Order picked at segment 50';
+										END_IF
+									END_IF;
+
+								END_IF;
+
+
+
+								// Run Task 1 / Task 2 only if shuttle is parked on its WS pad
+								// Map WS -> pad segment
+								CASE gShuttleList[i].WorkStation OF
+									1: padSeg := 52;
+									2: padSeg := 54;
+									3: padSeg := 56;
+									4: padSeg := 7;
+									5: padSeg := 5;
+									6: padSeg := 3;
+									ELSE
+										padSeg := 0;
+								END_CASE;
+
+								// Only run tasks when we actually have an order AND we are parked on the pad
+								IF gShuttleList[i].HasOrder AND (padSeg <> 0) AND (Positioner_0.Segment = padSeg) THEN
+									// Stay parked on the pad while executing tasks
+									gShuttleList[i].MovementCommand(Execute := FALSE);
+
+									// Kick off Task 1 if no task is active
+									IF gShuttleList[i].CurrentTask = 0 THEN
+										gShuttleList[i].CurrentTask := 1;
+									END_IF;
+
+									// --- Task 1 ---
+									IF gShuttleList[i].CurrentTask = 1 THEN
+										gShuttleList[i].TaskT1(IN := TRUE,  PT := cTASK1_TIME);
+										gShuttleList[i].TaskT2(IN := FALSE, PT := cTASK2_TIME);
+										IF gShuttleList[i].TaskT1.Q THEN
+											gShuttleList[i].TaskT1(IN := FALSE, PT := cTASK1_TIME);
+											gShuttleList[i].CurrentTask := 2;
+											Substate.StateInfo := 'Task 1 finished';
+										END_IF
+
+									// --- Task 2 ---
+									ELSIF gShuttleList[i].CurrentTask = 2 THEN
+										gShuttleList[i].TaskT1(IN := FALSE, PT := cTASK1_TIME);
+										gShuttleList[i].TaskT2(IN := TRUE,  PT := cTASK2_TIME);
+										IF gShuttleList[i].TaskT2.Q THEN
+											gShuttleList[i].TaskT2(IN := FALSE, PT := cTASK2_TIME);
+											gShuttleList[i].CurrentTask := 0;
+											gShuttleList[i].OrderStatus := TRUE;   // order complete
+
+											// Force forks to return path
+											gShuttleList[i].WorkStation := 0;
+
+											Substate.StateInfo := 'Task 2 finished – order complete';
+										END_IF
+									END_IF;
+
+								ELSE
+									// Not on pad (or no order): both timers OFF
+									gShuttleList[i].TaskT1(IN := FALSE, PT := cTASK1_TIME);
+									gShuttleList[i].TaskT2(IN := FALSE, PT := cTASK2_TIME);
+								END_IF;
+								
+
+								// Order delivery at segment 1 -> record metrics and clear shuttle state
+								IF (Positioner_0.Segment = 1) AND gShuttleList[i].OrderStatus THEN
+									// Compute job time
+
+									// If StartMs is in the struct: durMs := NowMs - gShuttleList[i].StartMs;
+									durMs := NowMs - ShStartMs[i];
+
+									// Push into ring buffer for statistics
+									CompWriteIx := (CompWriteIx MOD MAX_SAMPLES) + 1;   // 1..MAX_SAMPLES
+									CompTimes[CompWriteIx] := durMs;
+									IF CompValidCount < MAX_SAMPLES THEN
+										CompValidCount := CompValidCount + 1;
+									END_IF
+
+									OrdersCompleted := OrdersCompleted + 1;
+
+									// Clear shuttle order state
+									gShuttleList[i].HasOrder    := FALSE;
+									gShuttleList[i].OrderStatus := FALSE;
+									gShuttleList[i].CurrentTask := 0;
+									gShuttleList[i].WorkStation := 0;
+
+									Substate.StateInfo := 'Order delivered at segment 1';
+								END_IF;
+														
+								// Continue to next substate
+								Substate.State := 30;
+							END_IF;
+
+
+
+						30:
+							// -----------------------------------------------------------------------------
+							Substate.StateInfo := 'Getting shuttle movement command';
+
+							// Feed Moving with current inputs
+							Moving_0.Segment      := Positioner_0.Segment;
+							Moving_0.WorkStation  := gShuttleList[i].WorkStation;
+							Moving_0.HasOrder     := gShuttleList[i].HasOrder;     // needed for: (Segment=29 AND HasOrder=FALSE)
+							Moving_0.OrderStatus  := gShuttleList[i].OrderStatus;  // lets Moving route to drop-off when done
+
+							// If your FB has no Execute/Done, just call it:
+							Moving_0();
+							Substate.State := 40;
+							
+
+					
+						40:
+							// -----------------------------------------------------------------------------
+							Substate.StateInfo := 'Moving shuttle';
+							
+							// HOLD FILTER: enforce 3-second pause at segment 1 and 50
+							// If the shuttle is in a mandatory hold window, cancel any movement and
+							// immediately continue with the next shuttle in the round-robin loop.
+							IF NowMs < StopUntil[i]  THEN
+								gShuttleList[i].MovementCommand(Execute := FALSE);
+
+								// Move to next shuttle index
+								Substate.State := 10;
+								i := i + 1;
+								IF i >= gMain.Status.ShuttlesPresent THEN
+									i := 0;
+								END_IF;
+
+								RETURN;   // IMPORTANT: exit Substate 40 without issuing movement
+							END_IF;
+
+
+							// Resolve workstation pad segment (padSeg) for the shuttle's WS
+							CASE gShuttleList[i].WorkStation OF
+								1: padSeg := 52;
+								2: padSeg := 54;
+								3: padSeg := 56;
+								4: padSeg := 7;
+								5: padSeg := 5;
+								6: padSeg := 3;
+								ELSE
+									padSeg := 0; // shuttle not assigned to any workstation
+							END_CASE;
+										
+											
+							// Determine index for workstation metrics (ws 1..6; ws=7 used only as debug)				
+							IF (gShuttleList[i].WorkStation >= 1) AND (gShuttleList[i].WorkStation <= 6) THEN
+								wsIdx := gShuttleList[i].WorkStation;
+							ELSE
+								wsIdx := 7; // debug slot
+							END_IF;
+
+					
+							// WS busy tracking
+							// A workstation is busy this second if:
+								//   a shuttle has an order
+								//   is parked on the workstation’s pad
+								//   and is executing Task 1 or Task 2 timers.
+							IF (padSeg <> 0)
+								AND (Positioner_0.Segment = padSeg)
+								AND gShuttleList[i].HasOrder
+								AND ((gShuttleList[i].CurrentTask = 1) OR (gShuttleList[i].CurrentTask = 2)) THEN
+								WSBusyAcc[wsIdx] := TRUE;
+							END_IF;
+							
+							
+							// HOLD CONDITIONS
+							// 1. At segment 50: hold until new order available (queue not empty)
+							IF (Positioner_0.Segment = 50)
+								AND (NOT gShuttleList[i].HasOrder)
+								AND (NextOIndex <= gOrders.Count) THEN
+								
+								gShuttleList[i].MovementCommand(Execute := FALSE);
+
+							// 2. On workstation pad: hold while executing Task 1 or Task 2
+							ELSIF (padSeg <> 0)
+								AND (Positioner_0.Segment = padSeg)
+								AND gShuttleList[i].HasOrder
+								AND ((gShuttleList[i].CurrentTask = 1) OR (gShuttleList[i].CurrentTask = 2)) THEN
+								
+								gShuttleList[i].MovementCommand(Execute := FALSE);
+								
+							// ROUTING / MOVEMENT
+							ELSE
+								// With an assigned order:
+									// Only move onto the WS pad if pad owner = 0 or matches shuttle ID.
+									// Otherwise remain in upstream segment until pad becomes free.
+								// Without an order:
+									// Use base routing (Moving_0) so shuttle returns to pickup area.
+						
+								IF gShuttleList[i].HasOrder THEN
+									// Resolve WS-specific pad and upstream segment
+									padSeg := WSPadSeg[gShuttleList[i].WorkStation];
+									upSeg  := UpstreamSeg[gShuttleList[i].WorkStation];
+									
+									// Claim workstation ownership when arriving at upstream segment
+									IF (gShuttleList[i].WorkStation >= 1) AND (gShuttleList[i].WorkStation <= 6) THEN
+										IF (Positioner_0.Segment = upSeg) THEN
+											IF PadOwner[gShuttleList[i].WorkStation] = 0 THEN
+												PadOwner[gShuttleList[i].WorkStation] := gShuttleList[i].ID;
+											END_IF;
+										END_IF;
+									END_IF;
+									
+									// Case A: pad owned by another shuttle -> WAIT in upstream
+									IF (gShuttleList[i].WorkStation >= 1) AND (gShuttleList[i].WorkStation <= 6) THEN
+
+										IF (PadOwner[gShuttleList[i].WorkStation] <> 0)
+											AND (PadOwner[gShuttleList[i].WorkStation] <> gShuttleList[i].ID) THEN
+											// If still in upstream segment -> hold movement
+											IF (upSeg <> 0) AND (Positioner_0.Segment = upSeg) THEN
+												gShuttleList[i].MovementCommand(Execute := FALSE);
+												
+											// Else proceed normally until reaching upstream
+											ELSE
+												IF NOT gShuttleList[i].MovementCommand.Execute THEN
+													gShuttleList[i].MovementCommand.Parameters.Position.X := Moving_0.MotionCommand.X;
+													gShuttleList[i].MovementCommand.Parameters.Position.Y := Moving_0.MotionCommand.Y;
+													gShuttleList[i].MovementCommand.Parameters.Mode := mcACP6D_MOVE_RELATIVE;
+												END_IF;
+												gShuttleList[i].MovementCommand(Execute := TRUE);
+												IF gShuttleList[i].MovementCommand.Done THEN
+													gShuttleList[i].MovementCommand(Execute := FALSE);
+												END_IF;
+											END_IF;
+
+										// Case B: pad free OR pad owned by us -> normal routing
+										ELSE
+											// Claim pad if arriving at upstream and unowned
+											IF (PadOwner[gShuttleList[i].WorkStation] = 0)
+												AND (upSeg <> 0)
+												AND (Positioner_0.Segment = upSeg) THEN
+												PadOwner[gShuttleList[i].WorkStation] := gShuttleList[i].ID;
+											END_IF;
+
+											// Issue movement to routed target
+											IF NOT gShuttleList[i].MovementCommand.Execute THEN
+												gShuttleList[i].MovementCommand.Parameters.Position.X := Moving_0.MotionCommand.X;
+												gShuttleList[i].MovementCommand.Parameters.Position.Y := Moving_0.MotionCommand.Y;
+												gShuttleList[i].MovementCommand.Parameters.Mode := mcACP6D_MOVE_RELATIVE;
+											END_IF;
+											gShuttleList[i].MovementCommand(Execute := TRUE);
+											IF gShuttleList[i].MovementCommand.Done THEN
+												gShuttleList[i].MovementCommand(Execute := FALSE);
+											END_IF;
+										END_IF;
+
+									// Case C: No workstation assigned -> normal routing
+									ELSE
+										IF NOT gShuttleList[i].MovementCommand.Execute THEN
+											gShuttleList[i].MovementCommand.Parameters.Position.X := Moving_0.MotionCommand.X;
+											gShuttleList[i].MovementCommand.Parameters.Position.Y := Moving_0.MotionCommand.Y;
+											gShuttleList[i].MovementCommand.Parameters.Mode := mcACP6D_MOVE_RELATIVE;
+										END_IF;
+										
+										gShuttleList[i].MovementCommand(Execute := TRUE);
+										IF gShuttleList[i].MovementCommand.Done THEN
+											gShuttleList[i].MovementCommand(Execute := FALSE);
+										END_IF;
+									END_IF;
+									
+								
+								// No order: follow basic routing toward pickup area
+								ELSE
+									IF NOT gShuttleList[i].MovementCommand.Execute THEN
+										gShuttleList[i].MovementCommand.Parameters.Position.X := Moving_0.MotionCommand.X;
+										gShuttleList[i].MovementCommand.Parameters.Position.Y := Moving_0.MotionCommand.Y;
+										gShuttleList[i].MovementCommand.Parameters.Mode := mcACP6D_MOVE_RELATIVE;
+									END_IF;
+
+									gShuttleList[i].MovementCommand(Execute := TRUE);
+									IF gShuttleList[i].MovementCommand.Done THEN
+										gShuttleList[i].MovementCommand(Execute := FALSE);
+									END_IF;
+								END_IF;
+							END_IF;
+
+
+
+
+							// Advance to next shuttle
+							Substate.State := 10;
+							i := i + 1;
+							IF i >= gMain.Status.ShuttlesPresent THEN
+								i := 0;
+							END_IF;
+
+
+					END_CASE;
+			END_CASE;
+
+		MAIN_ERROR:
+			// If operator presses ErrorReset -> move to reset state
+			IF gMain.Cmd.ErrorReset THEN
+				AssemblyReset.Execute := FALSE; // ensure clean start for reset FB
+				MainState := MAIN_RESET;
+			END_IF
+
+		MAIN_RESET:
+			// Execute a full assembly reset command
+			AssemblyReset.Execute := TRUE;
+
+			IF AssemblyReset.Done THEN
+				// Reset completed successfully -> return to normal startup sequence
+				gMain.Cmd.ErrorReset := FALSE;
+				AssemblyReset.Execute := FALSE;
+				MainState := MAIN_POWER_OFF;
+				
+				//Commands which caused error are not reset yet
+					// Clean up any leftover commands that may be stuck from error state
+				AssemblyPowerOff.Execute := FALSE;
+				AssemblyPowerOn.Execute := FALSE;
+				AssemblyGetShuttle.Enable := FALSE;
+				AssemblyGetShuttle.Next := FALSE;
+				
+			ELSIF AssemblyReset.Error OR AssemblyReset.CommandAborted THEN
+				// Reset failed -> stay in MAIN_ERROR
+				gMain.Cmd.ErrorReset := FALSE;
+				MainState := MAIN_ERROR;
+			END_IF
+		
+	END_CASE   // State machine ends
+
+	// Update global assembly status for HMI (Human–Machine Interface) and diagnostics
+	gMain.Status.AssemblyState := AssemblyReadInfo.AssemblyInfo.AssemblyState;
+	
+	// Call all ACP6D and application FBs every scan
+	AssemblyReadInfo();
+	AssemblyPowerOn();
+	AssemblyPowerOff();
+	AssemblyReset();
+	AssemblyGetShuttle();
+	ShuttleMoveXY();
+	
+	// Order list logic must run every scan
+	gOrders();
+	
+	// SystemActive Flag
+	SystemActive := gMain.Cmd.Power AND (State.State = 400);
+
+	// Heartbeat: 1 second tick
+		// TON runs continuously; we gate metric updates using SystemActive.
+	Tmr1s(IN := TRUE, PT := T#1s);
+
+	IF Tmr1s.Q THEN
+		Tmr1s(IN := FALSE);  // reset the timer for next pulse
+
+		// Compute queue length for display (even when not running)
+		QueueLen := gOrders.Count - (NextOIndex - 1);
+		IF QueueLen < 0 THEN
+			QueueLen := 0;
+		END_IF
+
+		IF SystemActive THEN
+			// Increase simulation run time, Advance run clock
+			ElapsedSec := ElapsedSec + 1;
+			NowMs := ElapsedSec * 1000;
+
+
+			// Workstation queue measurement
+			// For each WS:
+				// WS is considered "occupied" when ANY shuttle is physically on its pad
+				// Queue = shuttles waiting upstream for that WS pad while someone else owns it
+				// Average queue = accumulated queue sum over occupied seconds only
+			FOR wsLoop := 1 TO 6 DO
+
+				padSeg := WSPadSeg[wsLoop];
+				upSeg  := UpstreamSeg[wsLoop];
+
+				// Detect if any shuttle is physically on WS pad
+				anyOnPad := FALSE;
+				FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+					IF LastSeg[k] = padSeg THEN
+						anyOnPad := TRUE;
+						EXIT;
+					END_IF
+				END_FOR
+
+				// ALWAYS compute queue length
+				curQ := 0;
+				FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+					IF gShuttleList[k].HasOrder AND (gShuttleList[k].WorkStation = wsLoop) THEN
+						// Shuttle is waiting in upstream AND pad is owned by someone else
+
+						IF gShuttleList[k].HasOrder
+							AND (gShuttleList[k].WorkStation = wsLoop)
+							AND (LastSeg[k] = upSeg)                           // Real queue, physically waiting
+							AND (PadOwner[wsLoop] <> 0)                        // pad is occupied
+							AND (PadOwner[wsLoop] <> gShuttleList[k].ID)       // someone else owns it
+							THEN
+							curQ := curQ + 1;
+						END_IF
+
+					END_IF
+				END_FOR
+
+				WSQueueInstant[wsLoop] := curQ;
+				WSQueueSum[wsLoop]     := WSQueueSum[wsLoop] + curQ;
+
+				// Count WS busy seconds only when a shuttle is actually ON the pad
+				IF WSQueueInstant[wsLoop] > 0 THEN
+					WSQueueBusySec[wsLoop] := WSQueueBusySec[wsLoop] + 1;
+				END_IF
+
+				// Compute average queue length during BUSY seconds (same as segments)
+				IF WSQueueBusySec[wsLoop] > 0 THEN
+					WSQueueAvg[wsLoop] := WSQueueSum[wsLoop] / WSQueueBusySec[wsLoop];
+				ELSE
+					WSQueueAvg[wsLoop] := 0.0;
+				END_IF
+
+			END_FOR
+
+
+
+			// Segment 1 queue measurement
+			// Count shuttles heading to segment 1’s upstream while another shuttle owns seg1
+			QueueSeg1Instant := 0;
+
+			IF Seg1Owner <> 0 THEN
+				FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+					IF gShuttleList[k].HasOrder THEN
+						IF gShuttleList[k].NextSeg = UpstreamSeg1 THEN
+							IF Seg1Owner <> gShuttleList[k].ID THEN
+								QueueSeg1Instant := QueueSeg1Instant + 1;
+							END_IF
+						END_IF
+					END_IF
+				END_FOR
+
+				QueueSeg1BusySec := QueueSeg1BusySec + 1;
+				QueueSeg1Sum := QueueSeg1Sum + QueueSeg1Instant;
+				QueueSeg1Avg := QueueSeg1Sum / QueueSeg1BusySec;
+
+			END_IF;
+
+
+			// Segment 50 queue measurement
+			// Count shuttles heading to segment 50's upstream while pickup is blocked
+			QueueSeg50Instant := 0;
+
+			IF Seg50Owner <> 0 THEN
+				FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+					// Shuttles without order came to pickup order
+					IF NOT gShuttleList[k].HasOrder THEN
+						// Shuttle tries to go upstream-segment 50
+						IF gShuttleList[k].NextSeg = UpstreamSeg50 THEN
+							// Someone else owns segment 50
+							IF Seg50Owner <> gShuttleList[k].ID THEN
+								QueueSeg50Instant := QueueSeg50Instant + 1;
+							END_IF
+						END_IF
+					END_IF
+				END_FOR
+
+				QueueSeg50BusySec := QueueSeg50BusySec + 1;
+				QueueSeg50Sum := QueueSeg50Sum + QueueSeg50Instant;
+				QueueSeg50Avg := QueueSeg50Sum / QueueSeg50BusySec;
+
+			END_IF;
+
+			
+			// Max queue for Segment 1 drop-off
+			IF QueueSeg1Instant > MaxQueueSeg1 THEN
+				MaxQueueSeg1 := QueueSeg1Instant;
+			END_IF;
+
+			// Max queue for Segment 50 pickup
+			IF QueueSeg50Instant > MaxQueueSeg50 THEN
+				MaxQueueSeg50 := QueueSeg50Instant;
+			END_IF;
+
+			
+			// Compute global average queue length across all workstations
+			sumQue := 0.0;
+			countWS := 0;
+
+			FOR ws := 1 TO 6 DO
+				IF WSQueueBusySec[ws] > 0 THEN
+					sumQue := sumQue + WSQueueAvg[ws];
+					countWS := countWS + 1;
+				END_IF
+			END_FOR
+
+			IF countWS > 0 THEN
+				GlobalQueueAvg := sumQue / countWS;
+			ELSE
+				GlobalQueueAvg := 0.0;
+			END_IF
+
+			
+			// For each WS:
+				// If no shuttle marked it busy this second ? WSIdleSec++
+				// Reset busy markers for next heartbeat window
+			FOR iSort := 1 TO 6 DO
+				IF NOT WSBusyAcc[iSort] THEN
+					WSIdleSec[iSort] := WSIdleSec[iSort] + 1;
+				END_IF
+				WSBusyAcc[iSort] := FALSE;
+			END_FOR
+			
+			
+			// --- Global average idle time (sum of idle times / 6 WS) ---
+			sumL := 0;
+
+			FOR ws := 1 TO 6 DO
+				sumL := sumL + WSIdleSec[ws];
+			END_FOR
+
+			GlobalIdleAvg := sumL / 6.0;   // avg idle seconds per workstation
+
+
+			// Throughput (orders/min) over active seconds
+			IF ElapsedSec > 0 THEN
+				ThroughputPerMin := OrdersCompleted * 60.0 / ElapsedSec;
+			ELSE
+				ThroughputPerMin := 0.0;
+			END_IF
+
+			
+			// Completion-time statistics
+			// Recompute average and 95th-percentile job duration each second.
+			// CompTimes[] is updated when a shuttle delivers an order at segment 1.
+			IF CompValidCount > 0 THEN
+				
+				// AVG
+				sumL := 0;
+				FOR iSort := 1 TO CompValidCount DO
+					sumL := sumL + CompTimes[iSort];
+				END_FOR
+				AvgCompMs := sumL / CompValidCount;
+
+				// P95: copy & sort TmpArr[1..CompValidCount]
+				FOR iSort := 1 TO CompValidCount DO
+					TmpArr[iSort] := CompTimes[iSort];
+				END_FOR
+
+				IF CompValidCount > 1 THEN
+					FOR iSort := 1 TO (CompValidCount - 1) DO
+						FOR jSort := (iSort + 1) TO CompValidCount DO
+							IF TmpArr[jSort] < TmpArr[iSort] THEN
+								tmpVal := TmpArr[iSort];
+								TmpArr[iSort] := TmpArr[jSort];
+								TmpArr[jSort] := tmpVal;
+							END_IF
+						END_FOR
+					END_FOR
+				END_IF
+
+				tmpN  := CompValidCount;
+				tmp95 := (95 * tmpN + 99) / 100;
+
+				IF tmp95 < 1 THEN
+					idx95 := 1;
+				ELSIF tmp95 > tmpN THEN
+					idx95 := CompValidCount;
+				ELSE
+					idx95 := tmp95;
+				END_IF;
+
+				P95CompMs := TmpArr[idx95];
+
+				// ms to s
+				AvgCompSec := AvgCompMs / 1000.0;
+				P95CompSec := P95CompMs / 1000.0;
+			ELSE
+				AvgCompMs := 0;
+				P95CompMs := 0;
+				AvgCompSec := 0.0;
+				P95CompSec := 0.0;
+			END_IF
+
+			
+		END_IF
+	END_IF
+
+
+	// Auto power-off logic
+	// Power off automatically when:
+		// no more orders to assign
+		// all assigned orders completed
+		// all shuttles idle (no tasks, no WS assignment)
+	AllDoneAndIdle := FALSE;
+
+	IF gMain.Cmd.Power AND (MainState = MAIN_READY) THEN
+		IF (NextOIndex > gOrders.Count) AND (OrdersCompleted >= OrdersAssigned) THEN
+			AllDoneAndIdle := TRUE;
+
+			FOR k := 0 TO gMain.Status.ShuttlesPresent - 1 DO
+				IF gShuttleList[k].HasOrder THEN
+					AllDoneAndIdle := FALSE;
+				END_IF;
+				IF (gShuttleList[k].CurrentTask <> 0) THEN
+					AllDoneAndIdle := FALSE;
+				END_IF;
+				IF (gShuttleList[k].WorkStation >= 1) AND (gShuttleList[k].WorkStation <= 6) THEN
+					AllDoneAndIdle := FALSE;
+				END_IF;
+			END_FOR
+		END_IF
+	END_IF;
+
+	
+	IF RunActive AND (SimEndMs = 0) THEN
+		SimEndMs := NowMs;
+		OverallCompMs  := SimEndMs - SimStartMs;
+		OverallCompSec := OverallCompMs / 1000.0;
+		RunActive := FALSE;
+	END_IF;
+
+	IF AllDoneAndIdle THEN
+		MainState := MAIN_POWER_OFF;   // Return to your standard power-off sequence
+	END_IF;
+	
+	FOR ws := 1 TO 6 DO
+		Debug_PadOwner[ws] := PadOwner[ws];
+	END_FOR
+
+
+
+		END_PROGRAM
